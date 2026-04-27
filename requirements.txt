@@ -1,0 +1,7 @@
+fastapi~=0.136.1
+pydantic
+uvicorn~=0.46.0
+starlette~=1.0.0
+openai>=1.30.0
+instructor>=1.7.0
+python-dotenv>=1.0.0
