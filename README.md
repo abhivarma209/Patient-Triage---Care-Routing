@@ -174,6 +174,108 @@ The service uses **OpenAI `gpt-4o-mini`** via the **instructor** library, which 
 
 The LLM is only invoked when no safety override rule applies, keeping deterministic safety logic fully independent of the model.
 
+### LLM Prompts
+
+**System Prompt**
+```
+You are a clinical triage assistant. Your role is to assess patient-reported symptoms
+and classify the urgency of care required. You must be conservative — when in doubt,
+assign a higher urgency level. Never downgrade urgency based on patient reassurances.
+
+Respond strictly in the required JSON schema. Do not add commentary outside the schema fields.
+```
+
+**User Prompt** (populated at runtime)
+```
+Assess the following patient and return a structured triage classification.
+
+Patient: {patient_name}, Age: {age}, Gender: {gender}
+Symptoms: {symptoms_joined_by_comma}
+Medical History: {medical_history_notes or "None provided"}
+
+Classify the triage level as one of: EMERGENCY, URGENT, STANDARD, SELF_CARE.
+Provide a confidence score between 0.0 and 1.0.
+List any red flags observed (CARDIAC_EVENT_RISK, STROKE_RISK, PEDIATRIC_HIGH_FEVER).
+Explain your reasoning in one or two sentences.
+```
+
+`instructor` wraps the OpenAI call and retries automatically if the model response fails Pydantic validation, ensuring the caller always receives a fully typed `LLMTriageAssessment` object.
+
+---
+
+## Semantic Safety Override Detection
+
+Safety overrides use **vector embeddings + semantic search** so that paraphrased or colloquial symptom descriptions (e.g. *"my face feels numb and droopy"*) still match the correct clinical rule — not just exact keyword matches.
+
+### How it works
+
+**At startup — build the override index**
+
+Each safety rule is represented by a set of descriptive trigger strings. The service calls the OpenAI Embeddings API (`text-embedding-3-small`) once for every trigger string and stores the resulting vectors in an in-memory list alongside the rule metadata.
+
+```
+Override trigger strings (examples)
+────────────────────────────────────────────────────────────────
+CARDIAC_EVENT_RISK  → "chest pain and difficulty breathing"
+                      "tightness in the chest with shortness of breath"
+                      "chest pressure and inability to breathe properly"
+
+STROKE_RISK         → "face drooping on one side"
+                      "sudden arm weakness or numbness"
+                      "slurred or garbled speech"
+                      "facial asymmetry with limb weakness"
+
+PEDIATRIC_HIGH_FEVER→ "high fever in a young child"
+                      "child under 12 with temperature above 39 degrees"
+                      "infant with severe fever"
+────────────────────────────────────────────────────────────────
+All vectors are computed once and kept in memory as a list of
+{vector, rule_name, confidence_score=1.0} dicts.
+```
+
+**At request time — search for a matching override**
+
+When a patient's symptoms arrive the service:
+
+1. Joins the symptoms list into a single string.
+2. Calls the Embeddings API to produce a query vector for that string.
+3. Computes **cosine similarity** between the query vector and every stored override vector.
+4. If the highest similarity score exceeds a configured threshold (default `0.82`), the corresponding safety rule fires and the LLM call is skipped.
+5. If no vector crosses the threshold, the request proceeds to the LLM assessment step.
+
+```
+Incoming symptoms  ──► embed ──► query_vector
+                                      │
+                          ┌───────────▼────────────┐
+                          │  cosine_similarity with │
+                          │  each override vector   │
+                          └───────────┬────────────┘
+                                      │
+                          max_score ≥ 0.82?
+                            │              │
+                           YES             NO
+                            │              │
+                      Override fires   LLM Assessment
+                      (rule_name,      (gpt-4o-mini
+                       score=1.0)       + instructor)
+```
+
+### In-memory store layout
+
+```python
+override_index: list[dict] = [
+    {
+        "trigger_text": "chest pain and difficulty breathing",
+        "rule":         "CARDIAC_EVENT_RISK",
+        "triage_level": "EMERGENCY",
+        "vector":       [0.021, -0.143, ...]  # 1536-dim float list
+    },
+    ...
+]
+```
+
+The index is populated once at application startup (`@app.on_event("startup")`) and shared across all requests via FastAPI dependency injection. No external vector database is required.
+
 ---
 
 ## Running the Service
@@ -197,7 +299,7 @@ pytest tests/test_triage.py -v
 
 ## Test Coverage
 
-The test suite covers all six acceptance criteria with 25 tests. Safety override tests (AC-2, AC-4, AC-5) require no API key — overrides fire before the LLM client is initialised. The LLM path (AC-1) is covered using a mock. The capacity scenario (AC-3) uses a patched department loader to inject a controlled zero-slot fixture.
+The test suite covers all six acceptance criteria with 25 tests. The LLM path (AC-1) is covered using a mock. The capacity scenario (AC-3) uses a patched department loader to inject a controlled zero-slot fixture.
 
 | AC | Scenario | Tests |
 |---|---|---|
